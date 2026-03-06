@@ -1,0 +1,15 @@
+{
+  "total_queries": 289,
+  "time_sensitive_queries": 139,
+  "time_insensitive_queries": 150,
+  "dropped_queries": 11,
+  "total_corpus_docs": 997,
+  "stale_candidates": 237,
+  "domains": {
+    "expertqa": 62,
+    "techqa": 43,
+    "covidqa": 72,
+    "cuad": 25,
+    "finqa": 35
+  }
+}
