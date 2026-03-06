@@ -16,8 +16,8 @@ Metrics tracked (per proposal):
 - Fresh displacement rate: how often stale docs push fresh answer-bearing docs out of top-k
 
 Usage:
-  python retrieval_eval.py --k 5 --corpus_dir /path/to/experiment/dir
-  python retrieval_eval.py --k 5 --corpus_dir /path/to/experiment/dir --conditions fresh stale_10
+  python retrieval_eval.py --corpus_dir ./freshrag_experiment --k 5
+  python retrieval_eval.py --corpus_dir ./freshrag_experiment --k 5 --conditions fresh
 """
 
 import json
