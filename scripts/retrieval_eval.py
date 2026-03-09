@@ -15,9 +15,9 @@ Metrics tracked (per proposal):
 - Retrieval latency (ms): time to embed query + search index
 - Fresh displacement rate: how often stale docs push fresh answer-bearing docs out of top-k
 
-Usage:
-  python retrieval_eval.py --corpus_dir ./freshrag_experiment --k 5
-  python retrieval_eval.py --corpus_dir ./freshrag_experiment --k 5 --conditions fresh
+Usage (run from repo root):
+  python scripts/retrieval_eval.py --corpus_dir ./freshrag_experiment --k 5
+  python scripts/retrieval_eval.py --corpus_dir ./freshrag_experiment --k 5 --conditions fresh
 """
 
 import json

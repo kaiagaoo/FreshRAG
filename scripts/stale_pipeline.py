@@ -8,11 +8,11 @@ Steps:
 4. Build four corpus conditions (Fresh, Stale-10%, 30%, 50%) stratified by domain
 5. Save corpus and query JSONL files
 
-Usage:
-  python stale_pipeline.py --step prep       # Steps 1-2: prepare stale candidates
-  python stale_pipeline.py --step generate   # Step 3: call Gemini API
-  python stale_pipeline.py --step build      # Steps 4-5: build four corpus conditions
-  python stale_pipeline.py --step all        # Run everything
+Usage (run from repo root):
+  python scripts/stale_pipeline.py --step prep       # Steps 1-2: prepare stale candidates
+  python scripts/stale_pipeline.py --step generate   # Step 3: call Gemini API
+  python scripts/stale_pipeline.py --step build      # Steps 4-5: build four corpus conditions
+  python scripts/stale_pipeline.py --step all        # Run everything
 """
 
 import json
@@ -26,9 +26,10 @@ from pathlib import Path
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-INPUT_QUERIES = "queries.jsonl"
-INPUT_CORPUS = "corpus.jsonl"
-OUTPUT_DIR = "freshrag_experiment"
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+INPUT_QUERIES = os.path.join(ROOT_DIR, "data", "queries.jsonl")
+INPUT_CORPUS = os.path.join(ROOT_DIR, "data", "corpus.jsonl")
+OUTPUT_DIR = os.path.join(ROOT_DIR, "freshrag_experiment")
 MAX_WORDS_FOR_STALE = 1000  # Truncate long docs before sending to Gemini
 RANDOM_SEED = 42
 GEMINI_MODEL = "gemini-2.5-flash"  # Change if needed
