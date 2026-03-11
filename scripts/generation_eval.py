@@ -13,6 +13,9 @@ Metrics tracked:
 - Generation latency (ms): wall-clock time per API call
 - API cost estimate: output_tokens × price_per_token
 - Response length (words): whitespace-split word count of the generated answer
+- Answer correctness (ROUGE-L F1): overlap between generated answer and ground truth
+- Hallucination rate: fraction of answers NOT entailed by the context
+  (NLI model: cross-encoder/nli-deberta-v3-base)
 
 Usage (run from repo root):
   python scripts/generation_eval.py --corpus_dir ./freshrag_experiment
@@ -21,16 +24,18 @@ Usage (run from repo root):
 
 import json
 import os
+import re
 import time
 import argparse
 import numpy as np
-from collections import defaultdict
 
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
 DEFAULT_MODEL = "gemini-2.5-flash"
 CONDITIONS = ["fresh", "stale_10", "stale_30", "stale_50"]
+NLI_MODEL_NAME = "cross-encoder/nli-deberta-v3-base"
+NLI_LABELS = ["contradiction", "entailment", "neutral"]
 
 # Gemini pricing per 1M tokens (as of 2025 — adjust if needed)
 # https://ai.google.dev/pricing
@@ -124,6 +129,97 @@ def estimate_cost(input_tokens, output_tokens, model):
 
 
 # ─────────────────────────────────────────────
+# ROUGE-L SCORER
+# ─────────────────────────────────────────────
+def _tokenize(text):
+    """Simple whitespace + punctuation tokenizer for ROUGE."""
+    return re.findall(r'\w+', text.lower())
+
+
+def _lcs_length(x, y):
+    """Compute length of longest common subsequence."""
+    m, n = len(x), len(y)
+    if m == 0 or n == 0:
+        return 0
+    # Space-optimised LCS
+    prev = [0] * (n + 1)
+    curr = [0] * (n + 1)
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if x[i - 1] == y[j - 1]:
+                curr[j] = prev[j - 1] + 1
+            else:
+                curr[j] = max(curr[j - 1], prev[j])
+        prev, curr = curr, [0] * (n + 1)
+    return prev[n]
+
+
+def rouge_l_f1(prediction, reference):
+    """Compute ROUGE-L F1 between prediction and reference strings."""
+    pred_tokens = _tokenize(prediction)
+    ref_tokens = _tokenize(reference)
+    if not pred_tokens or not ref_tokens:
+        return 0.0
+    lcs = _lcs_length(pred_tokens, ref_tokens)
+    precision = lcs / len(pred_tokens) if pred_tokens else 0
+    recall = lcs / len(ref_tokens) if ref_tokens else 0
+    if precision + recall == 0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
+# ─────────────────────────────────────────────
+# NLI HALLUCINATION DETECTOR
+# ─────────────────────────────────────────────
+class HallucinationDetector:
+    """Check if generated answer is entailed by context using NLI."""
+
+    def __init__(self, model_name=NLI_MODEL_NAME):
+        from sentence_transformers import CrossEncoder
+        import torch
+
+        device = "cpu" if not torch.cuda.is_available() else "cuda"
+        print(f"  Loading NLI model: {model_name} (device={device})")
+        self.model = CrossEncoder(model_name, device=device)
+
+    def check(self, context, answer):
+        """
+        Check if answer is entailed by context.
+
+        For long answers, splits into sentences and uses worst-case verdict.
+
+        Returns:
+            is_hallucination: bool (True if NOT entailed)
+            verdict: str ('entailment', 'contradiction', or 'neutral')
+        """
+        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', answer.strip()) if len(s.strip()) > 10]
+        if not sentences:
+            sentences = [answer.strip()]
+
+        # Truncate context for model input (DeBERTa max ~512 tokens)
+        context_words = context.split()
+        if len(context_words) > 400:
+            context_truncated = " ".join(context_words[:400])
+        else:
+            context_truncated = context
+
+        pairs = [[context_truncated, sent] for sent in sentences]
+        scores = self.model.predict(pairs)
+
+        worst_priority = {"entailment": 0, "neutral": 1, "contradiction": 2}
+        worst_label = "entailment"
+
+        for score_arr in scores:
+            label_idx = int(np.argmax(score_arr))
+            label = NLI_LABELS[label_idx]
+            if worst_priority.get(label, 0) > worst_priority.get(worst_label, 0):
+                worst_label = label
+
+        is_hallucination = worst_label != "entailment"
+        return is_hallucination, worst_label
+
+
+# ─────────────────────────────────────────────
 # AGGREGATION
 # ─────────────────────────────────────────────
 def _agg(results):
@@ -137,6 +233,8 @@ def _agg(results):
         "latency_ms",
         "cost_usd",
         "response_length_words",
+        "answer_correctness",
+        "is_hallucination",
     ]
 
     agg = {"n": len(results)}
@@ -162,6 +260,8 @@ def print_summary_table(all_results, conditions, model):
     print("-" * (35 + 16 * len(conditions)))
 
     metrics_to_show = [
+        ("Answer correctness ROUGE-L (mean)", "answer_correctness_mean", ".4f"),
+        ("Hallucination rate", "is_hallucination_mean", ".4f"),
         ("Input tokens (mean)", "input_tokens_mean", ".1f"),
         ("Output tokens (mean)", "output_tokens_mean", ".1f"),
         ("Generation latency ms (mean)", "latency_ms_mean", ".1f"),
@@ -196,7 +296,8 @@ def print_summary_table(all_results, conditions, model):
         print("  " + "-" * (33 + 16 * len(conditions)))
 
         for label, key, fmt in [
-            ("Input tokens (mean)", "input_tokens_mean", ".1f"),
+            ("Answer correctness ROUGE-L", "answer_correctness_mean", ".4f"),
+            ("Hallucination rate", "is_hallucination_mean", ".4f"),
             ("Output tokens (mean)", "output_tokens_mean", ".1f"),
             ("Latency ms (mean)", "latency_ms_mean", ".1f"),
             ("Response length words", "response_length_words_mean", ".1f"),
@@ -277,6 +378,9 @@ def main():
         print("  Example: export GOOGLE_API_KEY='your-key-here'")
         return
 
+    # ── Initialize hallucination detector ──
+    hallucination_detector = HallucinationDetector(NLI_MODEL_NAME)
+
     print("=" * 60)
     print("GENERATION STAGE EVALUATION")
     print(f"  Model: {model}")
@@ -356,6 +460,15 @@ def main():
             response_length_words = len(generated_answer.split())
             total_cost += cost_usd
 
+            # Answer correctness (ROUGE-L F1 vs ground truth)
+            ground_truth = payload["ground_truth"]
+            answer_correctness = rouge_l_f1(generated_answer, ground_truth)
+
+            # Hallucination detection (NLI: answer vs context)
+            is_hallucination, nli_verdict = hallucination_detector.check(
+                context, generated_answer
+            )
+
             result = {
                 "query_id": query_id,
                 "condition": cond,
@@ -371,6 +484,9 @@ def main():
                 "latency_ms": latency_ms,
                 "cost_usd": cost_usd,
                 "response_length_words": response_length_words,
+                "answer_correctness": answer_correctness,
+                "is_hallucination": 1 if is_hallucination else 0,
+                "nli_verdict": nli_verdict,
                 # Carry forward context assembly metadata
                 "assembled_doc_ids": payload["assembled_doc_ids"],
                 "answer_bearing_in_context": payload["answer_bearing_in_context"],
@@ -404,6 +520,8 @@ def main():
         cond_results = [r for r in all_results if r["condition"] == cond]
         agg = _agg(cond_results)
         print(f"\n  Quick summary for {cond} ({agg.get('n', 0)} queries):")
+        print(f"    Answer correctness:      {agg.get('answer_correctness_mean', 0):.4f}")
+        print(f"    Hallucination rate:      {agg.get('is_hallucination_mean', 0):.4f}")
         print(f"    Input tokens (mean):     {agg.get('input_tokens_mean', 0):.1f}")
         print(f"    Output tokens (mean):    {agg.get('output_tokens_mean', 0):.1f}")
         print(f"    Latency ms (mean):       {agg.get('latency_ms_mean', 0):.1f}")
