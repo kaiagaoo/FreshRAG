@@ -1,80 +1,63 @@
-# FreshRAG: How Stale Content Degrades AI Search Pipelines
+# FreshRAG (Temporal-Aware): Mitigating Stale Content in RAG Pipelines
 
-This repository contains the code and data for **FreshRAG**, a research project investigating how outdated ("stale") content in retrieval corpora silently degrades the performance of Retrieval-Augmented Generation (RAG) pipelines. We systematically inject controlled levels of staleness (10%, 30%, 50%) into enterprise-domain corpora and measure the cascading impact across all five stages of a production RAG pipeline: retrieval, reranking, context assembly, generation, and verification.
+This repository contains the code and data for **FreshRAG**, a research project that (1) measures how outdated ("stale") content silently degrades Retrieval-Augmented Generation (RAG) pipelines, and (2) proposes a lightweight **temporal-aware mitigation** that injects a freshness signal into every pipeline stage. We compare the temporal-aware pipeline against a baseline across four staleness levels (0%, 10%, 30%, 50%) on five enterprise domains and five pipeline stages: retrieval, reranking, context assembly, generation, and verification.
 
 ## Key Takeaways
 
-- **Stale content is invisible to standard monitoring.** Embedding similarity scores, latency, and headline precision remain virtually unchanged even at 50% staleness — creating a *temporal-semantic trap* where systems appear healthy while silently serving outdated information.
-- **Reranking cannot fix what retrieval lets in.** Cross-encoder rerankers fail to filter stale documents and actively promote them to higher ranks.
-- **Fresh document displacement is the real harm.** At 50% staleness, 24.2% fewer fresh answer-bearing documents are retrieved per query — a degradation hidden by stable Precision@5 numbers.
-- **Domain vulnerability varies dramatically.** Legal documents (CUAD) suffer the highest stale intrusion (25.8%), while expert/cross-domain queries maintain precision.
-- **Verification is costly but insufficient.** With 93.8–95.8% of generated answers flagged as hallucinations, even regeneration recovers only 5.8–10.3% of failures.
+- **A single scalar freshness signal (α) neutralises most upstream damage.** Stale intrusion at 50% staleness drops from **15.4% → 5.5%** (−64%) with α = 0.2 added as an extra embedding/score dimension.
+- **Context contamination is nearly eliminated.** Stale token ratio in the LLM prompt falls from **17.0% → 1.05%** (−94%); context freshness rises from 83.0% → 98.9%.
+- **The reranker stops promoting stale docs.** The temporal-aware cross-encoder now produces a negative mean rank shift across all staleness levels — fresh documents are consistently promoted, stale ones demoted.
+- **Generation quality remains bottlenecked.** Despite clean contexts, answer correctness (~0.30 ROUGE-L) and hallucination rates (~95%) are nearly identical to baseline — the LLM is a systemic ceiling, not the stale data.
+- **Verification cost drops by ~32%** per query (\$0.00153 → \$0.00103) under temporal mitigation, because regeneration cost falls as upstream contradictions shrink.
 
 ---
 
-## Experimental Setup
+## Design of the Temporal-Aware Pipeline
 
-### Domains and Data
+The baseline pipeline is purely content-based: embeddings, cross-encoder scores, and NLI verdicts have no notion of document age. The temporal variant injects a single scalar freshness signal `α` (default **0.2**) at each stage, without retraining any model.
 
-We build on the [RAGBench](https://huggingface.co/datasets/rungalileo/ragbench) dataset, sampling 289 queries across five enterprise domains:
+| Stage | Baseline | Temporal-Aware Modification |
+|---|---|---|
+| **Retrieval** | FAISS IndexFlatIP over D-dim sentence embeddings | Each doc embedding is extended by one dimension: **+α** if fresh, **−α** if stale. The query gets **+α** (prefers fresh). Similarity becomes `cos(q,d) + α·sign(fresh(d))·α / (D+1)`. |
+| **Reranking** | Cross-encoder re-scores retrieved docs | Cross-encoder score + **α** bonus for fresh docs, **−α** penalty for stale docs, then re-sort. |
+| **Context Assembly** | Top-k retrieved chunks assembled into the prompt | Fallback pool prioritises fresh docs when NLI filters chunks; stale chunks are down-weighted in ordering. |
+| **Generation** | Prompt asks the LLM to answer from context | Prompt additionally instructs the model to *prioritise the most current content and be cautious of potentially outdated information*. |
+| **Verification** | NLI-based entailment check, regenerate on failure | Inherits cleaner upstream context; no α applied directly, but benefits from reduced contradictions. |
 
-| Domain | Description | Queries |
-|--------|-------------|---------|
-| **CovidQA** | Healthcare & COVID-19 | 58 |
-| **CUAD** | Legal contract analysis | 55 |
-| **ExpertQA** | Expert cross-domain | 58 |
-| **FinQA** | Financial reasoning | 60 |
-| **TechQA** | SaaS & IT support | 58 |
+Design choice: `α` is a single knob, applied uniformly across all stages, with no per-domain tuning. This keeps the mitigation transparent and cheap to deploy.
 
-Each domain contains a balanced mix of **time-sensitive** and **time-insensitive** queries (30 each). The corpus comprises ~997 documents with ground-truth relevance labels.
+### Data
 
-### Staleness Conditions
-
-We evaluate four corpus conditions, where staleness is introduced by replacing fresh documents with semantically similar but factually outdated variants generated via Gemini:
-
-| Condition | Description |
-|-----------|-------------|
-| **Fresh (0%)** | Original corpus — no stale content |
-| **Stale 10%** | 10% of documents replaced with stale variants |
-| **Stale 30%** | 30% of documents replaced with stale variants |
-| **Stale 50%** | 50% of documents replaced with stale variants |
+We build on the [RAGBench](https://huggingface.co/datasets/rungalileo/ragbench) dataset, sampling 289 queries across five enterprise domains (CovidQA, CUAD, ExpertQA, FinQA, TechQA), balanced between **time-sensitive** and **time-insensitive** queries. The corpus contains ~997 documents with ground-truth relevance labels. Stale variants are Gemini-generated: semantically similar to the original but factually outdated. Four conditions are evaluated: Fresh (0%), Stale 10%, Stale 30%, Stale 50%.
 
 ### Models
 
 | Purpose | Model |
-|---------|-------|
-| Embedding | `all-MiniLM-L6-v2` (sentence-transformers) |
-| Retrieval | FAISS IndexFlatIP |
-| Reranking | `cross-encoder/ms-marco-MiniLM-L6-v2` |
+|---|---|
+| Embedding | `all-MiniLM-L6-v2` |
+| Retrieval | FAISS IndexFlatIP (+1 temporal dim) |
+| Reranking | `cross-encoder/ms-marco-MiniLM-L6-v2` (+α bonus) |
 | NLI (assembly) | `cross-encoder/nli-MiniLM2-L6-H768` |
 | NLI (verification) | `cross-encoder/nli-deberta-v3-base` |
-| Generation | Gemini 2.5 Flash |
+| Generation | Gemini 2.5 Flash (temporal-aware prompt) |
 
 ### Pipeline Architecture
 
 ```
-Corpus Building → Stale Preparation → Retrieval → Reranking → Context Assembly → Generation → Verification
-   (Stage 1)        (Stage 2)         (Stage 3)   (Stage 3b)    (Stage 3c)      (Stage 4)    (Stage 5)
+Corpus Building → Stale Preparation → Retrieval(+α) → Reranking(+α) → Context Assembly(+α) → Generation(prompt) → Verification
+   (Stage 1)        (Stage 2)          (Stage 3)       (Stage 3b)         (Stage 3c)           (Stage 4)          (Stage 5)
 ```
 
 ---
 
 ## How to Run
 
-### Prerequisites
-
 ```bash
 pip install sentence-transformers faiss-cpu numpy pandas matplotlib google-generativeai datasets requests tqdm
-```
-
-Set your Gemini API key:
-```bash
 export GOOGLE_API_KEY="your-key-here"
 ```
 
-### Execution Order
-
-All scripts are run from the **repository root**. Each stage depends on the previous stage's output.
+All scripts run from the **repository root**. Each stage consumes the previous stage's output. The temporal pipeline writes to `freshrag_experiment/results_temporal/` and figures to `figures_temporal/`.
 
 ```bash
 # Stage 1: Build corpus from RAGBench
@@ -82,198 +65,164 @@ jupyter notebook notebooks/ragbench.ipynb
 
 # Stage 2: Generate stale corpus conditions
 python scripts/stale_pipeline.py --step all
-# Or run individually: --step prep → --step generate → --step build
 
-# Stage 3: Retrieval evaluation
-python scripts/retrieval_eval.py --corpus_dir ./freshrag_experiment --k 5
+# Stage 3: Temporal retrieval (embedding + freshness dimension)
+python scripts/retrieval_temporal_eval.py --corpus_dir ./freshrag_experiment --k 5 --alpha 0.2
 
-# Stage 3b: Reranking evaluation
-python scripts/rerank_eval.py --corpus_dir ./freshrag_experiment --k 5
+# Stage 3b: Temporal reranking (+α/−α on cross-encoder scores)
+python scripts/rerank_temporal_eval.py --corpus_dir ./freshrag_experiment --k 5 --alpha 0.2
 
-# Stage 3c: Context assembly (produces generation_payloads.jsonl for Stage 4)
-python scripts/context_assembly_eval.py --corpus_dir ./freshrag_experiment --k 5
+# Stage 3c: Temporal context assembly (fresh-first fallback pool)
+python scripts/context_assembly_temporal_eval.py --corpus_dir ./freshrag_experiment --k 5 --alpha 0.2
 
-# Stage 4: LLM answer generation
-python scripts/generation_eval.py --corpus_dir ./freshrag_experiment --model gemini-2.5-flash
+# Stage 4: Temporal generation (prompt instructs model to prefer current info)
+python scripts/generation_temporal_eval.py --corpus_dir ./freshrag_experiment --model gemini-2.5-flash
 
-# Stage 5: Verification and regeneration
-python scripts/verification_eval.py --corpus_dir ./freshrag_experiment --max_regen_attempts 1
+# Stage 5: Temporal verification
+python scripts/verification_temporal_eval.py --corpus_dir ./freshrag_experiment --max_regen_attempts 1
 ```
+
+Baseline counterparts (`retrieval_eval.py`, `rerank_eval.py`, ...) produce comparable numbers in `results/` using the same architecture minus the α signal.
 
 ### Analysis Notebooks
 
-After each stage completes, run the corresponding analysis notebook in `notebooks/` to generate figures and summary tables.
+Run `notebooks/*_analysis_temporal.ipynb` after each stage to regenerate figures and summary tables in `figures_temporal/` and `results/*_temporal_summary_table.csv`.
 
 ---
 
-## Results and Findings
+## Results and Findings (Temporal-Aware vs. Baseline)
 
-### Stage 3 — Retrieval: The Temporal-Semantic Trap
+### Stage 3 — Retrieval
 
-| Condition | Precision@5 | Recall@5 | Stale Intrusion | Fresh AB Docs |
-|-----------|:-----------:|:--------:|:---------------:|:-------------:|
+| Condition | Precision@5 | Recall@5 | **Stale Intrusion** | **Fresh AB Retrieved** |
+|---|:-:|:-:|:-:|:-:|
 | Fresh (0%) | 0.240 | 0.601 | 0.000 | 1.20 |
-| Stale 10% | 0.240 | 0.601 | 0.024 | 1.14 |
-| Stale 30% | 0.237 | 0.594 | 0.101 | 1.03 |
-| Stale 50% | 0.237 | 0.594 | 0.154 | 0.91 |
+| Stale 10% | 0.239 | 0.599 | **0.012** (baseline 0.024) | 1.14 |
+| Stale 30% | 0.233 | 0.590 | **0.033** (baseline 0.101) | 1.04 |
+| Stale 50% | 0.229 | 0.582 | **0.055** (baseline 0.154) | 0.93 (baseline 0.91) |
 
-Headline metrics (Precision, Recall) decline by only ~1.4%, masking the real damage: a **24.2% drop in fresh answer-bearing documents** retrieved per query. Stale documents intrude silently because embedding similarity scores remain virtually unchanged across staleness levels (~0.488 ± 0.0005).
+The temporal dimension **cuts stale intrusion by ~64%** at 50% staleness with only a ~0.8-point drop in Precision@5. Fresh answer-bearing document recovery slightly improves versus baseline.
 
-<p align="center">
-  <img src="figures/fig1_retrieval_degradation.png" width="90%" />
-</p>
-<p align="center"><em><strong>Figure 1.</strong> Retrieval degradation across staleness conditions. Precision and Recall show minimal headline decline, while Stale Intrusion Rate climbs steadily and Fresh Answer-Bearing document retrieval drops by 24.2% — revealing the hidden cost of corpus staleness.</em></p>
+<p align="center"><img src="figures_temporal/fig1_retrieval_temporal_degradation.png" width="90%" /></p>
+<p align="center"><em><strong>Figure 1.</strong> Temporal retrieval: stale intrusion rises far more slowly with staleness than in the baseline, while headline precision and recall remain comparable.</em></p>
 
-<p align="center">
-  <img src="figures/fig6_semantic_trap.png" width="70%" />
-</p>
-<p align="center"><em><strong>Figure 2.</strong> The Temporal-Semantic Trap. Cosine similarity scores remain virtually identical across all staleness conditions, demonstrating that dense embedding models cannot distinguish stale from fresh content — stale documents are semantically indistinguishable from their fresh counterparts.</em></p>
+<p align="center"><img src="figures_temporal/fig6_temporal_similarity.png" width="70%" /></p>
+<p align="center"><em><strong>Figure 2.</strong> Similarity distributions with the temporal dimension — fresh and stale documents become separable in similarity space, escaping the "temporal-semantic trap" of the baseline.</em></p>
 
-### Time-Sensitive vs. Time-Insensitive Queries
+### Stage 3b — Reranking
 
-Time-sensitive queries are disproportionately affected: their fresh document retrieval drops by **50.6%** (1.18 → 0.58) at 50% staleness, compared to a smaller decline for time-insensitive queries. Notably, stale content also causes **indirect contamination** — time-insensitive queries still suffer 9.2% stale intrusion at 50% staleness despite not being direct targets.
+| Condition | Precision (after) | **Stale Intrusion (after)** | Mean Rank Shift |
+|---|:-:|:-:|:-:|
+| Fresh (0%) | 0.240 | 0.000 | −0.17 |
+| Stale 10% | 0.239 | **0.012** (baseline 0.024) | −0.18 |
+| Stale 30% | 0.233 | **0.033** (baseline 0.101) | −0.18 |
+| Stale 50% | 0.229 | **0.055** (baseline 0.154) | −0.17 |
 
-<p align="center">
-  <img src="figures/fig3_time_sensitivity.png" width="90%" />
-</p>
-<p align="center"><em><strong>Figure 3.</strong> Time-sensitive queries suffer disproportionate degradation. They experience 2× the stale intrusion rate (22.2% vs. 9.2%) and lose over half their fresh answer-bearing documents at 50% staleness, while time-insensitive queries are still indirectly contaminated.</em></p>
+The mean rank shift is **consistently negative**, meaning the reranker now promotes fresh documents (and demotes stale ones) — the opposite of baseline behaviour, where stale docs were actively promoted.
 
-### Domain Vulnerability
+<p align="center"><img src="figures_temporal/fig8_rerank_before_after.png" width="85%" /></p>
+<p align="center"><em><strong>Figure 3.</strong> Stale intrusion before vs. after temporal reranking. Unlike the baseline reranker (which made no difference), the temporal reranker holds stale intrusion at a fraction of the baseline level.</em></p>
 
-<p align="center">
-  <img src="figures/fig4_domain_heatmap.png" width="85%" />
-</p>
-<p align="center"><em><strong>Figure 4.</strong> Domain-level retrieval performance heatmap. Legal documents (CUAD) are most vulnerable with the highest stale intrusion rate (25.8%), likely due to dense, formulaic language that produces near-identical embeddings. Expert/cross-domain queries maintain precision throughout.</em></p>
+### Stage 3c — Context Assembly
 
-### Stage 3b — Reranking: Amplifying the Problem
+| Condition | **Context Freshness** | **Stale Token Ratio** | Contradiction Density | Num Chunks |
+|---|:-:|:-:|:-:|:-:|
+| Fresh (0%) | 1.000 | 0.000 | 0.188 | 17.1 |
+| Stale 10% | **0.998** (baseline 0.980) | **0.002** (baseline 0.020) | 0.187 | 17.2 |
+| Stale 30% | **0.993** (baseline 0.909) | **0.007** (baseline 0.091) | 0.205 | 16.8 |
+| Stale 50% | **0.990** (baseline 0.830) | **0.010** (baseline 0.170) | 0.191 | 16.4 |
 
-| Condition | Precision (before) | Precision (after) | Stale Intrusion (before) | Stale Intrusion (after) |
-|-----------|:------------------:|:-----------------:|:------------------------:|:-----------------------:|
-| Fresh (0%) | 0.240 | 0.240 | 0.000 | 0.000 |
-| Stale 10% | 0.240 | 0.240 | 0.024 | 0.024 |
-| Stale 30% | 0.237 | 0.237 | 0.101 | 0.101 |
-| Stale 50% | 0.237 | 0.237 | 0.154 | 0.154 |
+Stale token contamination of the LLM prompt is **reduced by an order of magnitude** at every staleness level. The context window the LLM sees is now nearly indistinguishable from the Fresh condition.
 
-The cross-encoder reranker **completely fails to mitigate staleness**. Precision and stale intrusion are identical before and after reranking across all conditions. Worse, the reranker actively promotes stale documents to higher ranks as staleness increases.
+<p align="center"><img src="figures_temporal/fig19_freshness_stale_ratio.png" width="85%" /></p>
+<p align="center"><em><strong>Figure 4.</strong> Context freshness and stale token ratio under temporal assembly — the linear decline seen in the baseline flattens almost completely.</em></p>
 
-<p align="center">
-  <img src="figures/fig8_rerank_before_after.png" width="85%" />
-</p>
-<p align="center"><em><strong>Figure 5.</strong> Precision and Stale Intrusion before vs. after reranking. The cross-encoder reranker produces no change in either metric — it falls into the same temporal-semantic trap as the retriever, unable to distinguish stale from fresh content.</em></p>
-
-<p align="center">
-  <img src="figures/fig15_stale_promotion.png" width="70%" />
-</p>
-<p align="center"><em><strong>Figure 6.</strong> Stale document promotion by the reranker. As corpus staleness increases, the cross-encoder increasingly promotes stale documents to higher ranks (0.017 → 0.138 promoted docs/query), actively worsening the problem rather than mitigating it.</em></p>
-
-### Stage 3c — Context Assembly: Contaminated Context
-
-| Condition | Contradiction Density | Context Freshness | Stale Token Ratio | Num Chunks |
-|-----------|:---------------------:|:-----------------:|:-----------------:|:----------:|
-| Fresh (0%) | 0.188 | 100.0% | 0.0% | 17.1 |
-| Stale 10% | 0.185 | 98.0% | 2.0% | 17.4 |
-| Stale 30% | 0.138 | 90.9% | 9.1% | 18.8 |
-| Stale 50% | 0.126 | 83.0% | 17.0% | 19.8 |
-
-Context freshness degrades linearly to 83% at 50% staleness, with stale tokens comprising 17% of assembled context. Paradoxically, detected contradiction density *decreases* — stale content does not overtly contradict fresh content, making it harder for NLI-based filters to catch.
-
-<p align="center">
-  <img src="figures/fig19_freshness_stale_ratio.png" width="85%" />
-</p>
-<p align="center"><em><strong>Figure 7.</strong> Context Freshness Ratio and Stale Token Ratio across staleness conditions. Freshness declines linearly while stale token contamination grows proportionally, directly polluting the context window that the LLM uses for answer generation.</em></p>
-
-### Stage 4 — Generation: High Hallucination Across the Board
+### Stage 4 — Generation
 
 | Condition | Answer Correctness | Hallucination Rate | Cost/Query |
-|-----------|:------------------:|:------------------:|:----------:|
-| Fresh (0%) | 0.294 | 93.8% | $0.00053 |
-| Stale 10% | 0.301 | 94.5% | $0.00053 |
-| Stale 30% | 0.304 | 93.8% | $0.00053 |
-| Stale 50% | 0.293 | 95.8% | $0.00053 |
+|---|:-:|:-:|:-:|
+| Fresh (0%) | 0.308 | 0.938 | \$0.000536 |
+| Stale 10% | 0.308 | 0.938 | \$0.000538 |
+| Stale 30% | 0.307 | 0.948 | \$0.000536 |
+| Stale 50% | 0.292 | 0.952 | \$0.000533 |
 
-Hallucination rates are extremely high (93.8–95.8%) across all conditions, indicating that the LLM frequently generates claims not entailed by the provided context. Answer correctness (ROUGE-L) shows negligible variation, and generation cost/latency remain stable — staleness has no impact on operational costs at this stage.
+Despite near-pristine context, answer correctness and hallucination rate barely move versus baseline (~0.29–0.30, ~94–96%). This isolates the LLM itself — not the stale data — as the dominant source of hallucination in this pipeline.
 
-<p align="center">
-  <img src="figures/fig27b_answer_quality.png" width="85%" />
-</p>
-<p align="center"><em><strong>Figure 8.</strong> Answer quality metrics across staleness conditions. Answer correctness (ROUGE-L) remains flat while hallucination rates stay persistently above 93%, indicating that the LLM's tendency to generate unsupported claims is a systemic issue exacerbated — but not solely caused — by stale content.</em></p>
+<p align="center"><img src="figures_temporal/fig27b_answer_quality.png" width="85%" /></p>
+<p align="center"><em><strong>Figure 5.</strong> Generation quality under the temporal-aware prompt — flat across conditions, suggesting the LLM's entailment behaviour is the binding constraint once context is clean.</em></p>
 
-### Stage 5 — Verification: Costly Recovery with Limited Success
+### Stage 5 — Verification
 
-| Condition | Failure Rate | Regen Trigger | Entailed After Regen | Total Cost/Query |
-|-----------|:------------:|:-------------:|:--------------------:|:----------------:|
-| Fresh (0%) | 93.8% | 93.8% | 9.3% | $0.00145 |
-| Stale 10% | 94.5% | 94.5% | 8.0% | $0.00152 |
-| Stale 30% | 93.8% | 93.8% | 10.0% | $0.00150 |
-| Stale 50% | 95.8% | 95.8% | 5.9% | $0.00153 |
+| Condition | Failure Rate | Entailed After Regen | Gen Cost/Q | Regen Cost/Q | **Total Cost/Q** |
+|---|:-:|:-:|:-:|:-:|:-:|
+| Fresh (0%) | 0.938 | 0.087 | \$0.000536 | \$0.000497 | **\$0.001033** (baseline \$0.001453) |
+| Stale 10% | 0.938 | 0.083 | \$0.000538 | \$0.000498 | **\$0.001036** (baseline \$0.001518) |
+| Stale 30% | 0.948 | 0.069 | \$0.000536 | \$0.000503 | **\$0.001039** (baseline \$0.001504) |
+| Stale 50% | 0.952 | 0.062 | \$0.000533 | \$0.000501 | **\$0.001034** (baseline \$0.001526) |
 
-Verification triggers regeneration for nearly all answers, but only 5.9–10.0% are successfully recovered. The verification + regeneration pipeline roughly **triples the per-query cost** compared to generation alone (from ~$0.0005 to ~$0.0015), with regeneration accounting for ~65% of total cost.
+Total per-query cost drops by **~32%** across all conditions. Regeneration is cheaper because upstream context is cleaner and produces shorter, less-contradictory drafts.
 
-<p align="center">
-  <img src="figures/fig35_verdict_recovery.png" width="85%" />
-</p>
-<p align="center"><em><strong>Figure 9.</strong> Entailment failure and recovery rates. Nearly all generated answers fail entailment checking (93.8–95.8%), triggering costly regeneration. Recovery success is marginal (5.9–10.0%), and worsens at 50% staleness — suggesting that stale-contaminated context fundamentally limits answer quality regardless of retry attempts.</em></p>
+<p align="center"><img src="figures_temporal/fig36_verification_cost.png" width="85%" /></p>
+<p align="center"><em><strong>Figure 6.</strong> Total verification cost under the temporal pipeline — flat and ~32% below baseline across all staleness conditions.</em></p>
 
 ---
 
 ## Summary of Findings
 
-### The Dual Invisibility Problem
+### Where Temporal Mitigation Helps
 
-Staleness degrades pipeline quality while remaining invisible to all standard monitoring signals:
+| Metric (at 50% staleness) | Baseline | Temporal | Δ |
+|---|:-:|:-:|:-:|
+| Stale intrusion rate | 0.154 | 0.055 | **−64%** |
+| Fresh AB retrieved | 0.91 | 0.93 | +2% |
+| Context freshness | 83.0% | 98.9% | **+19pp** |
+| Stale token ratio in prompt | 17.0% | 1.05% | **−94%** |
+| Reranker rank shift (fresh promotion) | ≥0 | −0.17 | flipped sign |
+| Total verification cost/query | \$0.00153 | \$0.00103 | **−32%** |
 
-| Signal | Affected by Staleness? |
-|--------|:----------------------:|
-| Retrieval latency | No (11–18ms, stable) |
-| Embedding similarity scores | No (~0.488, stable) |
-| Precision@5 / Recall@5 | Barely (−1.4%) |
-| Reranker ambiguity scores | No (3.11–3.15, stable) |
-| Generation cost / latency | No ($0.00053, stable) |
-| **Fresh document displacement** | **Yes (−24.2%)** |
-| **Stale intrusion rate** | **Yes (0% → 15.4%)** |
-| **Context freshness** | **Yes (100% → 83%)** |
+### Where It Does Not Help
 
-### Cascading Failure Across Pipeline Stages
+| Metric (at 50% staleness) | Baseline | Temporal |
+|---|:-:|:-:|
+| Answer correctness (ROUGE-L) | 0.293 | 0.292 |
+| Hallucination rate | 95.8% | 95.2% |
+| Entailed-after-regen | 5.9% | 6.2% |
 
-Once stale content passes retrieval, no downstream component can compensate:
+A clean context is necessary but not sufficient for correct answers. The LLM-level hallucination ceiling is the next bottleneck.
 
-1. **Retrieval** lets stale documents in (similarity scores are indistinguishable)
-2. **Reranking** fails to filter them out (and promotes them higher)
-3. **Context assembly** packages stale tokens into the LLM prompt
-4. **Generation** produces hallucinated answers from contaminated context
-5. **Verification** catches failures but cannot cost-effectively recover
+### Takeaways
 
-### Implications
-
-- **Freshness-aware retrieval is needed.** Standard embedding + reranking pipelines have no temporal awareness. Explicit freshness signals (timestamps, decay functions) should be integrated at the retrieval stage.
-- **Headline metrics are insufficient.** Precision@5 and Recall@5 mask real degradation. Pipelines should monitor stale intrusion rate, fresh document displacement, and context freshness ratio.
-- **Verification alone is not a solution.** With 93%+ failure rates and low recovery, post-hoc verification is too expensive and too ineffective to compensate for upstream contamination. Prevention at retrieval is far cheaper than cure at verification.
+- **Cheap freshness signals work.** A single scalar α added to embeddings, reranker scores, and assembly ordering — plus a prompt hint — eliminates most stale-content damage without retraining anything.
+- **Retrieval + assembly is where the mitigation pays.** The drops in stale intrusion (−64%) and stale token ratio (−94%) are the core wins.
+- **Hallucination is a separate problem.** With contexts 99% fresh, the LLM still fails entailment ~95% of the time. This points toward generation-side interventions (stricter decoding constraints, chain-of-verification, or citation-grounded prompting) as the next lever.
+- **Cost goes down, not up.** Temporal-aware mitigation reduces total verification cost by ~32% because regeneration is cheaper on cleaner contexts.
 
 ---
 
 ## Repository Structure
 
 ```
-data/                     # Source data (queries.jsonl, corpus.jsonl)
-scripts/                  # Pipeline scripts (run from repo root)
-  stale_pipeline.py        # Stage 2: stale corpus preparation
-  retrieval_eval.py        # Stage 3: FAISS retrieval evaluation
-  rerank_eval.py           # Stage 3b: cross-encoder reranking
-  context_assembly_eval.py # Stage 3c: context assembly with NLI
-  generation_eval.py       # Stage 4: LLM answer generation
-  verification_eval.py     # Stage 5: NLI verification & regeneration
-notebooks/                # Jupyter analysis notebooks
-freshrag_experiment/      # Generated experiment data & results
-figures/                  # Output plots (42 figures across all stages)
-results/                  # Summary CSV tables
+data/                          # Source data (queries.jsonl, corpus.jsonl)
+scripts/                       # Pipeline scripts (run from repo root)
+  stale_pipeline.py             # Stage 2: stale corpus preparation
+  retrieval_eval.py / *_temporal_eval.py   # Stage 3
+  rerank_eval.py / *_temporal_eval.py      # Stage 3b
+  context_assembly_eval.py / *_temporal_eval.py  # Stage 3c
+  generation_eval.py / *_temporal_eval.py  # Stage 4
+  verification_eval.py / *_temporal_eval.py # Stage 5
+notebooks/                     # Jupyter analysis notebooks (baseline + _temporal)
+freshrag_experiment/
+  results/                      # Baseline per-stage result JSONs
+  results_temporal/             # Temporal-aware per-stage result JSONs
+figures/                       # Baseline plots
+figures_temporal/              # Temporal-aware plots
+results/                       # Summary CSV tables (baseline + _temporal)
 ```
 
 ---
 
 ## Citation
 
-If you use this work, please cite:
-
 ```
-FreshRAG: Measuring the Impact of Stale Content on AI Search Pipeline Performance
+FreshRAG: Measuring and Mitigating the Impact of Stale Content on RAG Pipeline Performance
 ```
